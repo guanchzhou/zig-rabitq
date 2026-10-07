@@ -19,7 +19,7 @@ from those bits with a known error bound.
 ## Install
 
 ```sh
-zig fetch --save <url or path of zig-rabitq>
+zig fetch --save git+https://github.com/guanchzhou/zig-rabitq
 ```
 
 ```zig

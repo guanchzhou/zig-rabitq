@@ -6,9 +6,9 @@ const index = rabitq.index;
 const usage =
     \\usage: zig-rabitq COMMAND < input.json
     \\
-    \\  encode  {"data":[[..]..],"seed":"HEX"?}
+    \\  encode  {"data":[[..]..],"bits":B?,"seed":"HEX"?}
     \\          -> {"padded":D,"codes":["HEX"..],"norms":[..],"dots":[..]}
-    \\  search  {"data":[[..]..],"queries":[[..]..],"k":K,"bq":B?,"rerank":R?,"seed":"HEX"?}
+    \\  search  {"data":[[..]..],"queries":[[..]..],"k":K,"bits":B?,"bq":Q?,"rerank":R?,"seed":"HEX"?}
     \\          -> {"results":[[i..]..]}   nearest first by estimated distance; with R > 0 the
     \\             R best estimates are re-ranked by exact distance before the top K are kept
     \\  version
@@ -81,12 +81,12 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (std.mem.eql(u8, cmd, "encode")) {
-        const in = parse(struct { data: []const []const f32, seed: ?[]const u8 = null }, arena, text);
+        const in = parse(struct { data: []const []const f32, bits: u8 = 1, seed: ?[]const u8 = null }, arena, text);
         const m = try flatten(arena, in.data, "data");
-        const ix = index.build(arena, m.data, m.d, seedOf(in.seed), null) catch |e| fail("{s}", .{@errorName(e)});
+        const ix = index.buildBits(arena, m.data, m.d, seedOf(in.seed), null, in.bits) catch |e| fail("{s}", .{@errorName(e)});
         const codes = try arena.alloc([]const u8, ix.n);
         for (codes, 0..) |*c, i| {
-            const hex = try arena.alloc(u8, ix.words * 16);
+            const hex = try arena.alloc(u8, ix.code(i).len * 16);
             for (ix.code(i), 0..) |w, j| _ = std.fmt.bufPrint(hex[j * 16 ..][0..16], "{x:0>16}", .{w}) catch unreachable;
             c.* = hex;
         }
@@ -98,6 +98,7 @@ pub fn main(init: std.process.Init) !void {
         data: []const []const f32,
         queries: []const []const f32,
         k: usize = 10,
+        bits: u8 = 1,
         bq: u8 = 4,
         rerank: usize = 0,
         seed: ?[]const u8 = null,
@@ -106,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
     const qs = try flatten(arena, in.queries, "queries");
     if (qs.d != m.d) fail("queries have {d} values, data has {d}", .{ qs.d, m.d });
     if (in.k == 0) fail("k must be at least 1", .{});
-    const ix = index.build(arena, m.data, m.d, seedOf(in.seed), null) catch |e| fail("{s}", .{@errorName(e)});
+    const ix = index.buildBits(arena, m.data, m.d, seedOf(in.seed), null, in.bits) catch |e| fail("{s}", .{@errorName(e)});
     const results = try arena.alloc([]u32, in.queries.len);
     const depth = @max(in.k, in.rerank);
     for (results, 0..) |*res, qi| {

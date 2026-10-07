@@ -10,6 +10,7 @@ const Mode = struct { round_seed: []const u8, estimates: []const Est, top5: []co
 const Golden = struct {
     cases: []const struct {
         d: usize,
+        bits: u8,
         seed: []const u8,
         data: []const f32,
         padded: usize,
@@ -34,7 +35,7 @@ test "codes, estimates and search match the NumPy reference" {
     const g = try std.json.parseFromSliceLeaky(Golden, arena, @embedFile("golden.json"), .{});
     for (g.cases) |c| {
         const seed = try std.fmt.parseInt(u64, c.seed, 10);
-        const ix = try index.build(arena, c.data, c.d, seed, null);
+        const ix = try index.buildBits(arena, c.data, c.d, seed, null, c.bits);
         try std.testing.expectEqual(c.padded, ix.padded);
         for (c.codes, 0..) |words, i| {
             for (words, ix.code(i)) |hex, w| try std.testing.expectEqual(try std.fmt.parseInt(u64, hex, 16), w);

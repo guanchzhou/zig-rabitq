@@ -23,6 +23,13 @@ pub const cases = [_]Case{
         .stdin = "{\"data\":[[1,0,0],[0,1,0]]}",
         .stdout = "{\"padded\":4,\"codes\":[\"000000000000000a\",\"0000000000000000\"],\"norms\":[0.7071067811865476,0.7071067811865476],\"dots\":[0.7071067811865475,0.7071067811865475]}\n",
     },
+    .{
+        .name = "search: 4-bit codes, no re-rank",
+        .args = &.{"search"},
+        .stdin = "{\"data\":[[1,0,0],[0.9,0.1,0],[0,1,0],[0,0,1],[-1,0,0]],\"queries\":[[1,0.05,0]],\"k\":3,\"bits\":4}",
+        .stdout = "{\"results\":[[0,1,2]]}\n",
+    },
+    .{ .name = "error: code bits", .args = &.{"encode"}, .stdin = "{\"data\":[[1,0],[0,1]],\"bits\":9}", .stderr = "CodeBitsOutOfRange", .exit = 1 },
     .{ .name = "error: ragged rows", .args = &.{"encode"}, .stdin = "{\"data\":[[1,2],[3]]}", .stderr = "data row 1 has 1 values, expected 2", .exit = 1 },
     .{ .name = "error: query width", .args = &.{"search"}, .stdin = "{\"data\":[[1,2]],\"queries\":[[1]]}", .stderr = "queries have 1 values, data has 2", .exit = 1 },
     .{ .name = "error: truncated JSON", .args = &.{"search"}, .stdin = "{", .stderr = "invalid input", .exit = 1 },

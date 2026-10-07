@@ -1,4 +1,5 @@
-//! RaBitQ with one bit per dimension (Gao and Long, SIGMOD 2024).
+//! RaBitQ (Gao and Long, SIGMOD 2024) and extended RaBitQ with several bits per dimension (Gao et
+//! al., SIGMOD 2025).
 //!
 //! Each data vector `o_r` is centred on `c`, normalised to `o = (o_r - c) / |o_r - c|` and rotated,
 //! `y = R o`. Its code is the sign of each coordinate; the quantised unit vector it stands for is
@@ -6,6 +7,12 @@
 //! rotated the same way) the estimator of `<o, q>` is `<x, R q> / <x, R o>`. It is unbiased, and with
 //! high probability its error is below `sqrt((1 - <x,Ro>^2) / <x,Ro>^2) * eps0 / sqrt(D - 1)`.
 //! Squared Euclidean distance follows from `|o_r - q_r|^2 = |o_r - c|^2 + |q_r - c|^2 - 2 |o_r - c| |q_r - c| <o, q>`.
+//!
+//! With `B > 1` bits per dimension the code is a point of the symmetric grid `sign(y) (m + 1/2)`,
+//! `m` in `0 .. 2^(B-1) - 1`, scaled to the unit sphere: `m_i = min(floor(t |y_i|), 2^(B-1) - 1)` for
+//! the scale `t` that maximises the cosine with `y`. The scale is found exactly by sweeping the
+//! breakpoints `t = k / |y_i|` in increasing order (ties by coordinate) and updating the cosine
+//! incrementally. `B = 1` is the sign code above. The estimator and its bound keep the same form.
 //!
 //! A query can be quantised to `bq` bits per coordinate with randomised rounding, so that `<x, Rq>`
 //! becomes a sum of popcounts over bit planes; `bq = 0` keeps it exact.
@@ -16,7 +23,7 @@ const rotate = @import("rotate.zig");
 /// The paper's default confidence parameter.
 pub const default_eps0 = 1.9;
 
-pub const Error = error{ OutOfMemory, DimensionMismatch, EmptyIndex, NonFiniteValue, QueryBitsOutOfRange };
+pub const Error = error{ OutOfMemory, DimensionMismatch, EmptyIndex, NonFiniteValue, QueryBitsOutOfRange, CodeBitsOutOfRange };
 
 pub const Index = struct {
     n: usize,
@@ -24,20 +31,29 @@ pub const Index = struct {
     padded: usize,
     words: usize,
     seed: u64,
+    /// Bits per dimension of the data codes.
+    bits: u8 = 1,
     centroid: []f32,
+    /// Bit planes per vector: `bits` planes of `words` words, plane `b` holding bit `b` of each level.
     codes: []u64,
     norms: []f64,
     dots: []f64,
+    /// For `bits > 1`: the norm of the grid point and the sum of its levels.
+    gnorms: []f64 = &.{},
+    sums: []f64 = &.{},
 
     pub fn deinit(ix: Index, gpa: std.mem.Allocator) void {
         gpa.free(ix.centroid);
         gpa.free(ix.codes);
         gpa.free(ix.norms);
         gpa.free(ix.dots);
+        gpa.free(ix.gnorms);
+        gpa.free(ix.sums);
     }
 
     pub fn code(ix: Index, i: usize) []const u64 {
-        return ix.codes[i * ix.words ..][0..ix.words];
+        const w = @as(usize, ix.bits) * ix.words;
+        return ix.codes[i * w ..][0..w];
     }
 };
 
@@ -45,9 +61,15 @@ fn checkFinite(x: []const f32) Error!void {
     for (x) |v| if (!std.math.isFinite(v)) return error.NonFiniteValue;
 }
 
-/// Builds the index of `n = data.len / dims` row-major vectors. With `centroid == null` the mean
-/// of the data is used.
+/// Builds the one-bit index of `n = data.len / dims` row-major vectors. With `centroid == null` the
+/// mean of the data is used.
 pub fn build(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u64, centroid: ?[]const f32) Error!Index {
+    return buildBits(gpa, data, dims, seed, centroid, 1);
+}
+
+/// As `build`, with `bits` (1 to 8) bits per dimension.
+pub fn buildBits(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u64, centroid: ?[]const f32, bits: u8) Error!Index {
+    if (bits == 0 or bits > 8) return error.CodeBitsOutOfRange;
     if (dims == 0 or data.len % dims != 0) return error.DimensionMismatch;
     const n = data.len / dims;
     if (n == 0) return error.EmptyIndex;
@@ -69,9 +91,15 @@ pub fn build(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u64, 
         };
         for (c, sum) |*x, s| x.* = @floatCast(s / @as(f64, @floatFromInt(n)));
     }
-    const codes = try gpa.alloc(u64, n * words);
+    const codes = try gpa.alloc(u64, n * bits * words);
     errdefer gpa.free(codes);
     @memset(codes, 0);
+    const gnorms = try gpa.alloc(f64, if (bits > 1) n else 0);
+    errdefer gpa.free(gnorms);
+    const sums = try gpa.alloc(f64, if (bits > 1) n else 0);
+    errdefer gpa.free(sums);
+    var ex: ExScratch = if (bits > 1) try .init(gpa, padded, bits) else undefined;
+    defer if (bits > 1) ex.deinit(gpa);
     const norms = try gpa.alloc(f64, n);
     errdefer gpa.free(norms);
     const dots = try gpa.alloc(f64, n);
@@ -90,9 +118,21 @@ pub fn build(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u64, 
         norms[i] = @sqrt(nn);
         if (nn == 0) {
             dots[i] = 1;
+            if (bits > 1) {
+                gnorms[i] = 1;
+                sums[i] = 0;
+            }
             continue;
         }
         rotate.apply(seed, r, y);
+        if (bits > 1) {
+            for (y) |*v| v.* /= norms[i];
+            const res = ex.encode(y, codes[i * bits * words ..][0 .. bits * words], words);
+            dots[i] = res.dot;
+            gnorms[i] = res.gnorm;
+            sums[i] = res.sum;
+            continue;
+        }
         var abs_sum: f64 = 0;
         for (y, 0..) |v, j| {
             if (v > 0) codes[i * words + j / 64] |= @as(u64, 1) << @intCast(j % 64);
@@ -100,8 +140,80 @@ pub fn build(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u64, 
         }
         dots[i] = abs_sum / norms[i] * inv_sqrt_d;
     }
-    return .{ .n = n, .dims = dims, .padded = padded, .words = words, .seed = seed, .centroid = c, .codes = codes, .norms = norms, .dots = dots };
+    return .{ .n = n, .dims = dims, .padded = padded, .words = words, .seed = seed, .bits = bits, .centroid = c, .codes = codes, .norms = norms, .dots = dots, .gnorms = gnorms, .sums = sums };
 }
+
+const Breakpoint = struct { t: f64, i: u32 };
+
+/// Exact scale search for extended RaBitQ codes.
+const ExScratch = struct {
+    half: u32,
+    points: []Breakpoint,
+    level: []u32,
+
+    fn init(gpa: std.mem.Allocator, padded: usize, bits: u8) !ExScratch {
+        const half = @as(u32, 1) << @intCast(bits - 1);
+        return .{ .half = half, .points = try gpa.alloc(Breakpoint, padded * (half - 1)), .level = try gpa.alloc(u32, padded) };
+    }
+
+    fn deinit(s: ExScratch, gpa: std.mem.Allocator) void {
+        gpa.free(s.points);
+        gpa.free(s.level);
+    }
+
+    fn before(_: void, a: Breakpoint, b: Breakpoint) bool {
+        return a.t < b.t or (a.t == b.t and a.i < b.i);
+    }
+
+    /// Writes the bit planes of the best grid point for unit vector `y`.
+    fn encode(s: ExScratch, y: []const f64, planes: []u64, words: usize) struct { dot: f64, gnorm: f64, sum: f64 } {
+        var np: usize = 0;
+        var num: f64 = 0;
+        for (y, 0..) |v, i| {
+            const a = @abs(v);
+            num += 0.5 * a;
+            if (a == 0) continue;
+            for (1..s.half) |k| {
+                s.points[np] = .{ .t = @as(f64, @floatFromInt(k)) / a, .i = @intCast(i) };
+                np += 1;
+            }
+        }
+        std.mem.sort(Breakpoint, s.points[0..np], {}, before);
+        var den2: f64 = 0.25 * @as(f64, @floatFromInt(y.len));
+        var best = num / @sqrt(den2);
+        var best_at: usize = 0;
+        @memset(s.level, 0);
+        for (s.points[0..np], 1..) |p, step| {
+            s.level[p.i] += 1;
+            num += @abs(y[p.i]);
+            den2 += 2 * @as(f64, @floatFromInt(s.level[p.i]));
+            const c = num / @sqrt(den2);
+            if (c > best) {
+                best = c;
+                best_at = step;
+            }
+        }
+        @memset(s.level, 0);
+        for (s.points[0..best_at]) |p| s.level[p.i] += 1;
+        var g2: f64 = 0;
+        var gy: f64 = 0;
+        var sum: f64 = 0;
+        @memset(planes, 0);
+        for (y, s.level, 0..) |v, m, i| {
+            const u: u32 = if (v > 0) s.half + m else s.half - 1 - m;
+            const g = @as(f64, @floatFromInt(u)) + 0.5 - @as(f64, @floatFromInt(s.half));
+            g2 += g * g;
+            gy += g * v;
+            sum += @floatFromInt(u);
+            var b: usize = 0;
+            while ((planes.len / words) > b) : (b += 1) {
+                if ((u >> @intCast(b)) & 1 == 1) planes[b * words + i / 64] |= @as(u64, 1) << @intCast(i % 64);
+            }
+        }
+        const gnorm = @sqrt(g2);
+        return .{ .dot = gy / gnorm, .gnorm = gnorm, .sum = sum };
+    }
+};
 
 pub const Query = struct {
     norm: f64,
@@ -175,6 +287,7 @@ pub fn estimate(ix: Index, q: Query, i: usize, eps0: f64) Estimate {
     const norm = ix.norms[i];
     if (norm == 0 or q.norm == 0) return .{ .ip = 0, .bound = 0, .dist2 = norm * norm + q.norm * q.norm };
     const cw = ix.code(i);
+    if (ix.bits > 1) return estimateEx(ix, q, i, cw, eps0);
     var on_sum: f64 = 0;
     var all_sum: f64 = 0;
     if (q.bq == 0) {
@@ -198,6 +311,33 @@ pub fn estimate(ix: Index, q: Query, i: usize, eps0: f64) Estimate {
     const dot = ix.dots[i];
     const ip = xq / dot;
     const bound = @sqrt(@max(0, 1 - dot * dot) / (dot * dot)) * eps0 / @sqrt(d - 1);
+    return .{ .ip = ip, .bound = bound, .dist2 = norm * norm + q.norm * q.norm - 2 * norm * q.norm * ip };
+}
+
+fn estimateEx(ix: Index, q: Query, i: usize, cw: []const u64, eps0: f64) Estimate {
+    const d: f64 = @floatFromInt(ix.padded);
+    const half: f64 = @floatFromInt(@as(u32, 1) << @intCast(ix.bits - 1));
+    const shift = 0.5 - half;
+    var s: f64 = 0;
+    if (q.bq == 0) {
+        for (q.y, 0..) |v, j| {
+            var u: u32 = 0;
+            for (0..ix.bits) |b| u |= @as(u32, @intCast((cw[b * ix.words + j / 64] >> @intCast(j % 64)) & 1)) << @intCast(b);
+            s += (@as(f64, @floatFromInt(u)) + shift) * v;
+        }
+    } else {
+        var uu: f64 = 0;
+        for (0..ix.bits) |a| for (0..q.bq) |b| {
+            var c: u64 = 0;
+            for (cw[a * ix.words ..][0..ix.words], q.planes[b * ix.words ..][0..ix.words]) |w, p| c += @popCount(w & p);
+            uu += @as(f64, @floatFromInt(c)) * @as(f64, @floatFromInt(@as(u32, 1) << @intCast(a + b)));
+        };
+        s = q.delta * uu + q.delta * shift * q.sum_u + q.low * ix.sums[i] + q.low * shift * d;
+    }
+    const dot = ix.dots[i];
+    const ip = s / ix.gnorms[i] / dot;
+    const bound = @sqrt(@max(0, 1 - dot * dot) / (dot * dot)) * eps0 / @sqrt(d - 1);
+    const norm = ix.norms[i];
     return .{ .ip = ip, .bound = bound, .dist2 = norm * norm + q.norm * q.norm - 2 * norm * q.norm * ip };
 }
 
@@ -290,6 +430,51 @@ test "the estimator is unbiased and its spread matches the bound" {
     try std.testing.expect(@abs(@sqrt(sq / t) / @sqrt(sigma / t) - 1) < 0.1);
     try std.testing.expect(@as(f64, @floatFromInt(covered19)) / t > 0.92);
     try std.testing.expect(@as(f64, @floatFromInt(covered3)) / t > 0.99);
+}
+
+test "extended codes: tighter with more bits, still unbiased" {
+    const gpa = std.testing.allocator;
+    const d = 256;
+    const data = try randomData(gpa, 300, d, 21);
+    defer gpa.free(data);
+    var prev_dot: f64 = 0;
+    for ([_]u8{ 1, 2, 4, 8 }) |bits| {
+        const ix = try buildBits(gpa, data, d, 3, null, bits);
+        defer ix.deinit(gpa);
+        var mean_dot: f64 = 0;
+        for (ix.dots) |v| mean_dot += v;
+        mean_dot /= @floatFromInt(ix.n);
+        try std.testing.expect(mean_dot > prev_dot);
+        prev_dot = mean_dot;
+        const q = try prepare(gpa, ix, data[5 * d ..][0..d], 0, 0);
+        defer q.deinit(gpa);
+        try std.testing.expectApproxEqAbs(@as(f64, 1), estimate(ix, q, 5, default_eps0).ip, 1e-12);
+        var qn: f64 = 0;
+        const qv = data[299 * d ..][0..d];
+        for (qv, ix.centroid) |x, m| qn += (@as(f64, x) - m) * (@as(f64, x) - m);
+        const qq = try prepare(gpa, ix, qv, 0, 0);
+        defer qq.deinit(gpa);
+        const q4 = try prepare(gpa, ix, qv, 4, 7);
+        defer q4.deinit(gpa);
+        var bias: f64 = 0;
+        var sq: f64 = 0;
+        var sigma: f64 = 0;
+        for (0..ix.n - 1) |i| {
+            var dot: f64 = 0;
+            for (data[i * d ..][0..d], qv, ix.centroid) |a, b, m| dot += (@as(f64, a) - m) * (@as(f64, b) - m);
+            const truth = dot / (ix.norms[i] * @sqrt(qn));
+            const e = estimate(ix, qq, i, 1);
+            bias += e.ip - truth;
+            sq += (e.ip - truth) * (e.ip - truth);
+            sigma += e.bound * e.bound;
+            // The 4-bit query path stays close to the exact query path.
+            try std.testing.expect(@abs(estimate(ix, q4, i, 1).ip - e.ip) < 0.05);
+        }
+        const nt: f64 = @floatFromInt(ix.n - 1);
+        try std.testing.expect(@abs(bias / nt) < 0.01);
+        try std.testing.expect(@sqrt(sq / nt) < 1.3 * @sqrt(sigma / nt));
+    }
+    try std.testing.expect(prev_dot > 0.99);
 }
 
 test "search ranks the query's own vector first" {

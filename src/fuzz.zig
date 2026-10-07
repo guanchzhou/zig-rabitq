@@ -22,7 +22,8 @@ fn invariants(_: void, smith: *Smith) anyerror!void {
     const d = upTo(smith, 1, 40);
     var data: [24 * 40]f32 = undefined;
     for (data[0 .. n * d]) |*x| x.* = @as(f32, @floatFromInt(smith.value(i16))) / 1024;
-    const ix = try index.build(gpa, data[0 .. n * d], d, smith.value(u64), null);
+    const bits: u8 = @intCast(upTo(smith, 1, 8));
+    const ix = try index.buildBits(gpa, data[0 .. n * d], d, smith.value(u64), null, bits);
     defer ix.deinit(gpa);
     for (0..n) |i| {
         try std.testing.expect(ix.dots[i] > 0 and ix.dots[i] <= 1 + 1e-12);

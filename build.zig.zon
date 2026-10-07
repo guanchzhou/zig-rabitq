@@ -1,0 +1,8 @@
+.{
+    .name = .zig_rabitq,
+    .version = "0.1.0",
+    .fingerprint = 0xa552ba6c7e2f435d,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "test", "examples", "LICENSE", "README.md", "CHANGELOG.md" },
+}

@@ -20,15 +20,28 @@ pub fn paddedLen(dims: usize) usize {
 
 /// In-place unnormalised fast Walsh-Hadamard transform; `x.len` must be a power of two.
 fn fwht(x: []f64) void {
+    const Vec = @Vector(4, f64);
     var h: usize = 1;
     while (h < x.len) : (h *= 2) {
         var i: usize = 0;
-        while (i < x.len) : (i += 2 * h) {
-            for (i..i + h) |j| {
-                const a = x[j];
-                const b = x[j + h];
-                x[j] = a + b;
-                x[j + h] = a - b;
+        if (h >= 4) {
+            while (i < x.len) : (i += 2 * h) {
+                var j: usize = i;
+                while (j < i + h) : (j += 4) {
+                    const a: Vec = x[j..][0..4].*;
+                    const b: Vec = x[j + h ..][0..4].*;
+                    x[j..][0..4].* = a + b;
+                    x[j + h ..][0..4].* = a - b;
+                }
+            }
+        } else {
+            while (i < x.len) : (i += 2 * h) {
+                for (i..i + h) |j| {
+                    const a = x[j];
+                    const b = x[j + h];
+                    x[j] = a + b;
+                    x[j + h] = a - b;
+                }
             }
         }
     }

@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var in_buf: [64 * 1024]u8 = undefined;
     var stdin = std.Io.File.stdin().readerStreaming(init.io, &in_buf);
-    const text = stdin.interface.allocRemaining(arena, .unlimited) catch |e| switch (e) {
+    const text = stdin.interface.allocRemaining(arena, .limited(256 * 1024 * 1024)) catch |e| switch (e) {
         error.ReadFailed => return stdin.err.?,
         else => |x| return x,
     };

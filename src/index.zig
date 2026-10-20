@@ -341,20 +341,70 @@ fn estimateEx(ix: Index, q: Query, i: usize, cw: []const u64, eps0: f64) Estimat
     return .{ .ip = ip, .bound = bound, .dist2 = norm * norm + q.norm * q.norm - 2 * norm * q.norm * ip };
 }
 
+pub const Hit = struct {
+    id: u32,
+    estimate: Estimate,
+};
+
+fn hitBefore(_: void, a: Hit, b: Hit) bool {
+    return a.estimate.dist2 < b.estimate.dist2 or (a.estimate.dist2 == b.estimate.dist2 and a.id < b.id);
+}
+
+fn siftUpHitMax(heap: []Hit, idx_in: usize) void {
+    var i = idx_in;
+    while (i > 0) {
+        const parent = (i - 1) / 2;
+        if (!hitBefore({}, heap[parent], heap[i])) break;
+        std.mem.swap(Hit, &heap[parent], &heap[i]);
+        i = parent;
+    }
+}
+
+fn siftDownHitMax(heap: []Hit, idx_in: usize) void {
+    var i = idx_in;
+    const n = heap.len;
+    while (true) {
+        var largest = i;
+        const left = 2 * i + 1;
+        const right = 2 * i + 2;
+        if (left < n and hitBefore({}, heap[largest], heap[left])) largest = left;
+        if (right < n and hitBefore({}, heap[largest], heap[right])) largest = right;
+        if (largest == i) break;
+        std.mem.swap(Hit, &heap[i], &heap[largest]);
+        i = largest;
+    }
+}
+
+/// Writes the `out.len` items with the smallest estimated distance into `out` (with their inner-product
+/// estimates and confidence bounds), nearest first; ties go to the lower index. Zero allocations.
+pub fn searchHits(ix: Index, q: Query, eps0: f64, out: []Hit) usize {
+    const k = @min(out.len, ix.n);
+    if (k == 0) return 0;
+    var count: usize = 0;
+    for (0..ix.n) |i| {
+        const cand: Hit = .{ .id = @intCast(i), .estimate = estimate(ix, q, i, eps0) };
+        if (count < k) {
+            out[count] = cand;
+            siftUpHitMax(out[0 .. count + 1], count);
+            count += 1;
+        } else if (hitBefore({}, cand, out[0])) {
+            out[0] = cand;
+            siftDownHitMax(out[0..k], 0);
+        }
+    }
+    std.mem.sort(Hit, out[0..count], {}, hitBefore);
+    return count;
+}
+
 /// The `out.len` indices with the smallest estimated distance, nearest first; ties to the lower index.
 pub fn search(gpa: std.mem.Allocator, ix: Index, q: Query, out: []u32) Error!usize {
     const k = @min(out.len, ix.n);
-    const Item = struct { i: u32, d: f64 };
-    const items = try gpa.alloc(Item, ix.n);
-    defer gpa.free(items);
-    for (items, 0..) |*it, i| it.* = .{ .i = @intCast(i), .d = estimate(ix, q, i, default_eps0).dist2 };
-    std.mem.sort(Item, items, {}, struct {
-        fn f(_: void, a: Item, b: Item) bool {
-            return a.d < b.d or (a.d == b.d and a.i < b.i);
-        }
-    }.f);
-    for (out[0..k], items[0..k]) |*o, it| o.* = it.i;
-    return k;
+    if (k == 0) return 0;
+    const hits = try gpa.alloc(Hit, k);
+    defer gpa.free(hits);
+    const got = searchHits(ix, q, default_eps0, hits);
+    for (out[0..got], hits[0..got]) |*o, h| o.* = h.id;
+    return got;
 }
 
 fn randomData(gpa: std.mem.Allocator, n: usize, d: usize, seed: u64) ![]f32 {
@@ -489,6 +539,12 @@ test "search ranks the query's own vector first" {
     var out: [5]u32 = undefined;
     try std.testing.expectEqual(@as(usize, 5), try search(gpa, ix, q, &out));
     try std.testing.expectEqual(@as(u32, 7), out[0]);
+    var hits: [5]Hit = undefined;
+    try std.testing.expectEqual(@as(usize, 5), searchHits(ix, q, default_eps0, &hits));
+    for (out, hits) |id, h| {
+        try std.testing.expectEqual(id, h.id);
+        try std.testing.expect(h.estimate.bound >= 0);
+    }
 }
 
 test "rejects bad input" {

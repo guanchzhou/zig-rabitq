@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: zig fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Zig 0.17.0
+        env:
+          ZIG_URL: https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
+          ZIG_SHA: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+        run: |
+          curl -fsSL "$ZIG_URL" -o zig.tar.xz
+          echo "$ZIG_SHA  zig.tar.xz" | shasum -a 256 -c -
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
+      - name: Check formatting
+        run: zig fmt --check src/ test/ examples/ build.zig build.zig.zon
+
+  test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zig_url: https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
+            zig_sha: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+            zig_dir: zig-x86_64-linux-0.17.0
+          - os: macos-latest
+            zig_url: https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz
+            zig_sha: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+            zig_dir: zig-aarch64-macos-0.17.0
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Zig 0.17.0
+        env:
+          ZIG_URL: ${{ matrix.zig_url }}
+          ZIG_SHA: ${{ matrix.zig_sha }}
+          ZIG_DIR: ${{ matrix.zig_dir }}
+        run: |
+          curl -fsSL "$ZIG_URL" -o zig.tar.xz
+          echo "$ZIG_SHA  zig.tar.xz" | shasum -a 256 -c -
+          tar -xf zig.tar.xz
+          echo "$PWD/$ZIG_DIR" >> "$GITHUB_PATH"
+      - name: Build & Test
+        run: zig build test

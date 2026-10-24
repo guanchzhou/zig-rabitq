@@ -19,7 +19,9 @@ jobs:
     name: zig fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Zig 0.17.0
         env:
           ZIG_URL: https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
@@ -48,7 +50,9 @@ jobs:
             zig_sha: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
             zig_dir: zig-aarch64-macos-0.17.0
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Zig 0.17.0
         env:
           ZIG_URL: ${{ matrix.zig_url }}

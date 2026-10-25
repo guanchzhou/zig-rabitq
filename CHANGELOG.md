@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 - 2026-10-25
+
+- Fix a leak in `buildBits` when the second extended-code scratch allocation fails.
+- `index.estimate` and `index.searchHits` now return errors: `error.IndexOutOfRange` for `i >= ix.n`, and `error.DimensionMismatch`, `error.CodeBitsOutOfRange` or `error.QueryBitsOutOfRange` when the index is inconsistent or the query was prepared for an index of another shape. Callers need `try`.
+- `buildBits` returns `error.TooManyVectors` above `maxInt(u32)` vectors and `error.DimensionTooLarge` when the padded dimension overflows; buffer sizes use checked multiplication.
+- `rotate.paddedLen` returns `error.DimensionTooLarge` instead of reaching `unreachable`, `rotate.apply` returns `error.DimensionMismatch` instead of asserting, and `rotate.applyInPlace` rotates an already padded buffer.
+- Centring falls back to f64 where the f32 difference `x - c` overflows, so huge but finite inputs no longer produce infinite norms. Other results are unchanged.
+- The one-bit exact-query estimate visits set code bits with `@ctz`; results are bit-identical.
+- Allocation-failure tests over `buildBits`, `prepare` and `search`.
+
 ## 0.2.1 - 2026-10-20
 
 - Add zero-allocation `index.searchHits` returning `{ id, estimate }` via an in-place bounded max-heap of size `k`, and update `index.search` to allocate $O(k)$ instead of sorting all $O(n)$ items.

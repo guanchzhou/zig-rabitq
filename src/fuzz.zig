@@ -30,10 +30,10 @@ fn invariants(_: void, smith: *Smith) anyerror!void {
         if (ix.norms[i] == 0) continue;
         const q = try index.prepare(gpa, ix, data[i * d ..][0..d], 0, 0);
         defer q.deinit(gpa);
-        const own = index.estimate(ix, q, i, index.default_eps0);
+        const own = try index.estimate(ix, q, i, index.default_eps0);
         try std.testing.expectApproxEqAbs(@as(f64, 1), own.ip, 1e-9);
         for (0..n) |j| {
-            const e = index.estimate(ix, q, j, index.default_eps0);
+            const e = try index.estimate(ix, q, j, index.default_eps0);
             try std.testing.expect(std.math.isFinite(e.ip) and e.bound >= 0 and std.math.isFinite(e.dist2));
         }
     }

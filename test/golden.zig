@@ -47,7 +47,7 @@ test "codes, estimates and search match the NumPy reference" {
                 const mode: Mode = @field(q, m[0]);
                 const qq = try index.prepare(arena, ix, q.q, m[1], try std.fmt.parseInt(u64, mode.round_seed, 10));
                 for (mode.estimates, 0..) |want, i| {
-                    const e = index.estimate(ix, qq, i, index.default_eps0);
+                    const e = try index.estimate(ix, qq, i, index.default_eps0);
                     try close(want.ip, e.ip);
                     try close(want.bound, e.bound);
                     try close(want.dist2, e.dist2);

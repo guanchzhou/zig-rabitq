@@ -34,7 +34,7 @@ const ix = try rabitq.index.buildBits(gpa, data, dims, seed, null, 4); // 4 bits
 defer ix.deinit(gpa);
 const q = try rabitq.index.prepare(gpa, ix, query, 4, round_seed); // 4-bit query, 0 for exact
 defer q.deinit(gpa);
-const e = rabitq.index.estimate(ix, q, i, rabitq.index.default_eps0); // .ip, .bound, .dist2
+const e = try rabitq.index.estimate(ix, q, i, rabitq.index.default_eps0); // .ip, .bound, .dist2
 _ = try rabitq.index.search(gpa, ix, q, top_k); // nearest first by estimated distance
 ```
 

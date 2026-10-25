@@ -23,7 +23,7 @@ const rotate = @import("rotate.zig");
 /// The paper's default confidence parameter.
 pub const default_eps0 = 1.9;
 
-pub const Error = error{ OutOfMemory, DimensionMismatch, EmptyIndex, NonFiniteValue, QueryBitsOutOfRange, CodeBitsOutOfRange };
+pub const Error = error{ OutOfMemory, DimensionMismatch, DimensionTooLarge, EmptyIndex, NonFiniteValue, QueryBitsOutOfRange, CodeBitsOutOfRange, TooManyVectors, IndexOutOfRange };
 
 pub const Index = struct {
     n: usize,
@@ -67,14 +67,16 @@ pub fn build(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u64, 
     return buildBits(gpa, data, dims, seed, centroid, 1);
 }
 
-/// As `build`, with `bits` (1 to 8) bits per dimension.
+/// As `build`, with `bits` (1 to 8) bits per dimension. At most `maxInt(u32)` vectors, since search
+/// reports `u32` ids.
 pub fn buildBits(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u64, centroid: ?[]const f32, bits: u8) Error!Index {
     if (bits == 0 or bits > 8) return error.CodeBitsOutOfRange;
     if (dims == 0 or data.len % dims != 0) return error.DimensionMismatch;
+    const padded = try rotate.paddedLen(dims);
     const n = data.len / dims;
     if (n == 0) return error.EmptyIndex;
+    if (n > std.math.maxInt(u32)) return error.TooManyVectors;
     try checkFinite(data);
-    const padded = rotate.paddedLen(dims);
     const words = padded / 64 + @intFromBool(padded % 64 != 0);
     const c = try gpa.alloc(f32, dims);
     errdefer gpa.free(c);
@@ -91,7 +93,7 @@ pub fn buildBits(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u
         };
         for (c, sum) |*x, s| x.* = @floatCast(s / @as(f64, @floatFromInt(n)));
     }
-    const codes = try gpa.alloc(u64, n * bits * words);
+    const codes = try gpa.alloc(u64, try mulSize(&.{ n, bits, words }));
     errdefer gpa.free(codes);
     @memset(codes, 0);
     const gnorms = try gpa.alloc(f64, if (bits > 1) n else 0);
@@ -104,17 +106,11 @@ pub fn buildBits(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u
     errdefer gpa.free(norms);
     const dots = try gpa.alloc(f64, n);
     errdefer gpa.free(dots);
-    const r = try gpa.alloc(f32, dims);
-    defer gpa.free(r);
     const y = try gpa.alloc(f64, padded);
     defer gpa.free(y);
     const inv_sqrt_d = 1.0 / @sqrt(@as(f64, @floatFromInt(padded)));
     for (0..n) |i| {
-        var nn: f64 = 0;
-        for (r, data[i * dims ..][0..dims], c) |*v, x, m| {
-            v.* = x - m;
-            nn += @as(f64, v.*) * v.*;
-        }
+        const nn = centre(y, data[i * dims ..][0..dims], c);
         norms[i] = @sqrt(nn);
         if (nn == 0) {
             dots[i] = 1;
@@ -124,7 +120,7 @@ pub fn buildBits(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u
             }
             continue;
         }
-        rotate.apply(seed, r, y);
+        try rotate.applyInPlace(seed, y);
         if (bits > 1) {
             for (y) |*v| v.* /= norms[i];
             const res = ex.encode(y, codes[i * bits * words ..][0 .. bits * words], words);
@@ -143,6 +139,25 @@ pub fn buildBits(gpa: std.mem.Allocator, data: []const f32, dims: usize, seed: u
     return .{ .n = n, .dims = dims, .padded = padded, .words = words, .seed = seed, .bits = bits, .centroid = c, .codes = codes, .norms = norms, .dots = dots, .gnorms = gnorms, .sums = sums };
 }
 
+fn mulSize(factors: []const usize) Error!usize {
+    var p: usize = 1;
+    for (factors) |f| p = std.math.mul(usize, p, f) catch return error.OutOfMemory;
+    return p;
+}
+
+/// Writes `x - m` into `y[0..x.len]` and zeros after it; returns its squared norm. The difference
+/// is taken in f32, as test/reference.py does, and in f64 only where the f32 one overflows.
+fn centre(y: []f64, x: []const f32, m: []const f32) f64 {
+    var nn: f64 = 0;
+    for (y[0..x.len], x, m) |*v, a, b| {
+        const narrow = a - b;
+        v.* = if (std.math.isFinite(narrow)) narrow else @as(f64, a) - b;
+        nn += v.* * v.*;
+    }
+    @memset(y[x.len..], 0);
+    return nn;
+}
+
 const Breakpoint = struct { t: f64, i: u32 };
 
 /// Exact scale search for extended RaBitQ codes.
@@ -151,9 +166,11 @@ const ExScratch = struct {
     points: []Breakpoint,
     level: []u32,
 
-    fn init(gpa: std.mem.Allocator, padded: usize, bits: u8) !ExScratch {
+    fn init(gpa: std.mem.Allocator, padded: usize, bits: u8) Error!ExScratch {
         const half = @as(u32, 1) << @intCast(bits - 1);
-        return .{ .half = half, .points = try gpa.alloc(Breakpoint, padded * (half - 1)), .level = try gpa.alloc(u32, padded) };
+        const points = try gpa.alloc(Breakpoint, try mulSize(&.{ padded, half - 1 }));
+        errdefer gpa.free(points);
+        return .{ .half = half, .points = points, .level = try gpa.alloc(u32, padded) };
     }
 
     fn deinit(s: ExScratch, gpa: std.mem.Allocator) void {
@@ -236,17 +253,12 @@ pub fn prepare(gpa: std.mem.Allocator, ix: Index, q: []const f32, bq: u8, round_
     if (q.len != ix.dims) return error.DimensionMismatch;
     if (bq > 8) return error.QueryBitsOutOfRange;
     try checkFinite(q);
-    const r = try gpa.alloc(f32, ix.dims);
-    defer gpa.free(r);
-    var nn: f64 = 0;
-    for (r, q, ix.centroid) |*v, x, m| {
-        v.* = x - m;
-        nn += @as(f64, v.*) * v.*;
-    }
-    const norm = @sqrt(nn);
+    if (ix.centroid.len != ix.dims or ix.padded < ix.dims) return error.DimensionMismatch;
+    if (ix.words != ix.padded / 64 + @intFromBool(ix.padded % 64 != 0)) return error.DimensionMismatch;
     const y = try gpa.alloc(f64, ix.padded);
     errdefer gpa.free(y);
-    rotate.apply(ix.seed, r, y);
+    const norm = @sqrt(centre(y, q, ix.centroid));
+    try rotate.applyInPlace(ix.seed, y);
     if (norm > 0) for (y) |*v| {
         v.* /= norm;
     };
@@ -282,7 +294,26 @@ pub const Estimate = struct {
     dist2: f64,
 };
 
-pub fn estimate(ix: Index, q: Query, i: usize, eps0: f64) Estimate {
+/// Checks that `ix` is consistent and that `q` was prepared for an index of its shape.
+fn checkPair(ix: Index, q: Query) Error!void {
+    if (ix.bits == 0 or ix.bits > 8) return error.CodeBitsOutOfRange;
+    if (q.bq > 8) return error.QueryBitsOutOfRange;
+    if (ix.padded < 2 or ix.words != ix.padded / 64 + @intFromBool(ix.padded % 64 != 0)) return error.DimensionMismatch;
+    if (ix.norms.len != ix.n or ix.dots.len != ix.n) return error.DimensionMismatch;
+    if (ix.codes.len != try mulSize(&.{ ix.n, ix.bits, ix.words })) return error.DimensionMismatch;
+    if (ix.bits > 1 and (ix.gnorms.len != ix.n or ix.sums.len != ix.n)) return error.DimensionMismatch;
+    if (q.y.len != ix.padded or q.planes.len != @as(usize, q.bq) * ix.words) return error.DimensionMismatch;
+}
+
+/// The estimate for stored vector `i`; `error.IndexOutOfRange` if `i >= ix.n`, and
+/// `error.DimensionMismatch` if `q` was prepared for an index of another shape.
+pub fn estimate(ix: Index, q: Query, i: usize, eps0: f64) Error!Estimate {
+    try checkPair(ix, q);
+    if (i >= ix.n) return error.IndexOutOfRange;
+    return estimateChecked(ix, q, i, eps0);
+}
+
+fn estimateChecked(ix: Index, q: Query, i: usize, eps0: f64) Estimate {
     const d: f64 = @floatFromInt(ix.padded);
     const norm = ix.norms[i];
     if (norm == 0 or q.norm == 0) return .{ .ip = 0, .bound = 0, .dist2 = norm * norm + q.norm * q.norm };
@@ -291,10 +322,15 @@ pub fn estimate(ix: Index, q: Query, i: usize, eps0: f64) Estimate {
     var on_sum: f64 = 0;
     var all_sum: f64 = 0;
     if (q.bq == 0) {
-        for (q.y, 0..) |v, j| {
-            if ((cw[j / 64] >> @intCast(j % 64)) & 1 == 1) on_sum += v;
-            all_sum += v;
+        for (cw, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                const j = wi * 64 + @ctz(w);
+                if (j >= q.y.len) break;
+                on_sum += q.y[j];
+            }
         }
+        for (q.y) |v| all_sum += v;
     } else {
         var ones: u64 = 0;
         for (cw) |w| ones += @popCount(w);
@@ -377,12 +413,14 @@ fn siftDownHitMax(heap: []Hit, idx_in: usize) void {
 
 /// Writes the `out.len` items with the smallest estimated distance into `out` (with their inner-product
 /// estimates and confidence bounds), nearest first; ties go to the lower index. Zero allocations.
-pub fn searchHits(ix: Index, q: Query, eps0: f64, out: []Hit) usize {
+pub fn searchHits(ix: Index, q: Query, eps0: f64, out: []Hit) Error!usize {
+    try checkPair(ix, q);
+    if (ix.n > std.math.maxInt(u32)) return error.TooManyVectors;
     const k = @min(out.len, ix.n);
     if (k == 0) return 0;
     var count: usize = 0;
     for (0..ix.n) |i| {
-        const cand: Hit = .{ .id = @intCast(i), .estimate = estimate(ix, q, i, eps0) };
+        const cand: Hit = .{ .id = @intCast(i), .estimate = estimateChecked(ix, q, i, eps0) };
         if (count < k) {
             out[count] = cand;
             siftUpHitMax(out[0 .. count + 1], count);
@@ -402,7 +440,7 @@ pub fn search(gpa: std.mem.Allocator, ix: Index, q: Query, out: []u32) Error!usi
     if (k == 0) return 0;
     const hits = try gpa.alloc(Hit, k);
     defer gpa.free(hits);
-    const got = searchHits(ix, q, default_eps0, hits);
+    const got = try searchHits(ix, q, default_eps0, hits);
     for (out[0..got], hits[0..got]) |*o, h| o.* = h.id;
     return got;
 }
@@ -428,14 +466,14 @@ test "codes and inner products" {
     const q = try prepare(gpa, ix, data[0..d], 0, 0);
     defer q.deinit(gpa);
     // The query equals data vector 0, so its own estimate is exactly 1.
-    try std.testing.expectApproxEqAbs(@as(f64, 1), estimate(ix, q, 0, default_eps0).ip, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), (try estimate(ix, q, 0, default_eps0)).ip, 1e-12);
     const q4 = try prepare(gpa, ix, data[d .. 2 * d], 4, 99);
     defer q4.deinit(gpa);
     const qx = try prepare(gpa, ix, data[d .. 2 * d], 0, 0);
     defer qx.deinit(gpa);
     for (0..ix.n) |i| {
-        const a = estimate(ix, q4, i, default_eps0).ip;
-        const b = estimate(ix, qx, i, default_eps0).ip;
+        const a = (try estimate(ix, q4, i, default_eps0)).ip;
+        const b = (try estimate(ix, qx, i, default_eps0)).ip;
         try std.testing.expect(@abs(a - b) < 0.1);
     }
 }
@@ -465,7 +503,7 @@ test "the estimator is unbiased and its spread matches the bound" {
             var dot: f64 = 0;
             for (data[i * d ..][0..d], qv, ix.centroid) |a, b, m| dot += (@as(f64, a) - m) * (@as(f64, b) - m);
             const truth = dot / (ix.norms[i] * @sqrt(qn));
-            const e = estimate(ix, q, i, 1);
+            const e = try estimate(ix, q, i, 1);
             const err = e.ip - truth;
             covered19 += @intFromBool(@abs(err) <= 1.9 * e.bound);
             covered3 += @intFromBool(@abs(err) <= 3 * e.bound);
@@ -498,7 +536,7 @@ test "extended codes: tighter with more bits, still unbiased" {
         prev_dot = mean_dot;
         const q = try prepare(gpa, ix, data[5 * d ..][0..d], 0, 0);
         defer q.deinit(gpa);
-        try std.testing.expectApproxEqAbs(@as(f64, 1), estimate(ix, q, 5, default_eps0).ip, 1e-12);
+        try std.testing.expectApproxEqAbs(@as(f64, 1), (try estimate(ix, q, 5, default_eps0)).ip, 1e-12);
         var qn: f64 = 0;
         const qv = data[299 * d ..][0..d];
         for (qv, ix.centroid) |x, m| qn += (@as(f64, x) - m) * (@as(f64, x) - m);
@@ -513,12 +551,12 @@ test "extended codes: tighter with more bits, still unbiased" {
             var dot: f64 = 0;
             for (data[i * d ..][0..d], qv, ix.centroid) |a, b, m| dot += (@as(f64, a) - m) * (@as(f64, b) - m);
             const truth = dot / (ix.norms[i] * @sqrt(qn));
-            const e = estimate(ix, qq, i, 1);
+            const e = try estimate(ix, qq, i, 1);
             bias += e.ip - truth;
             sq += (e.ip - truth) * (e.ip - truth);
             sigma += e.bound * e.bound;
             // The 4-bit query path stays close to the exact query path.
-            try std.testing.expect(@abs(estimate(ix, q4, i, 1).ip - e.ip) < 0.05);
+            try std.testing.expect(@abs((try estimate(ix, q4, i, 1)).ip - e.ip) < 0.05);
         }
         const nt: f64 = @floatFromInt(ix.n - 1);
         try std.testing.expect(@abs(bias / nt) < 0.01);
@@ -540,7 +578,7 @@ test "search ranks the query's own vector first" {
     try std.testing.expectEqual(@as(usize, 5), try search(gpa, ix, q, &out));
     try std.testing.expectEqual(@as(u32, 7), out[0]);
     var hits: [5]Hit = undefined;
-    try std.testing.expectEqual(@as(usize, 5), searchHits(ix, q, default_eps0, &hits));
+    try std.testing.expectEqual(@as(usize, 5), try searchHits(ix, q, default_eps0, &hits));
     for (out, hits) |id, h| {
         try std.testing.expectEqual(id, h.id);
         try std.testing.expect(h.estimate.bound >= 0);
@@ -552,4 +590,95 @@ test "rejects bad input" {
     try std.testing.expectError(error.DimensionMismatch, build(gpa, &.{ 1, 2, 3 }, 2, 0, null));
     try std.testing.expectError(error.EmptyIndex, build(gpa, &.{}, 2, 0, null));
     try std.testing.expectError(error.NonFiniteValue, build(gpa, &.{ 1, std.math.inf(f32) }, 2, 0, null));
+}
+
+test "estimate and searchHits reject out-of-range ids and mismatched queries" {
+    const gpa = std.testing.allocator;
+    const data = try randomData(gpa, 6, 10, 4);
+    defer gpa.free(data);
+    const ix = try buildBits(gpa, data, 10, 2, null, 3);
+    defer ix.deinit(gpa);
+    const q = try prepare(gpa, ix, data[0..10], 2, 1);
+    defer q.deinit(gpa);
+    _ = try estimate(ix, q, 5, default_eps0);
+    try std.testing.expectError(error.IndexOutOfRange, estimate(ix, q, 6, default_eps0));
+    try std.testing.expectError(error.IndexOutOfRange, estimate(ix, q, std.math.maxInt(usize), default_eps0));
+
+    const wide_data = try randomData(gpa, 3, 40, 5);
+    defer gpa.free(wide_data);
+    const wide = try buildBits(gpa, wide_data, 40, 2, null, 3);
+    defer wide.deinit(gpa);
+    const wq = try prepare(gpa, wide, wide_data[0..40], 2, 1);
+    defer wq.deinit(gpa);
+    try std.testing.expectError(error.DimensionMismatch, estimate(ix, wq, 0, default_eps0));
+    var hits: [2]Hit = undefined;
+    try std.testing.expectError(error.DimensionMismatch, searchHits(ix, wq, default_eps0, &hits));
+    var bad = q;
+    bad.bq = 9;
+    try std.testing.expectError(error.QueryBitsOutOfRange, estimate(ix, bad, 0, default_eps0));
+    var bad_ix = ix;
+    bad_ix.n = 7;
+    try std.testing.expectError(error.DimensionMismatch, estimate(bad_ix, q, 6, default_eps0));
+}
+
+test "buildBits rejects dimensions whose padding overflows" {
+    const gpa = std.testing.allocator;
+    const dims = (@as(usize, 1) << 63) + 1;
+    const fake: [*]const f32 = @ptrFromInt(@alignOf(f32));
+    try std.testing.expectError(error.DimensionTooLarge, buildBits(gpa, fake[0..dims], dims, 0, null, 1));
+}
+
+test "centring huge values does not overflow" {
+    const gpa = std.testing.allocator;
+    const big = std.math.floatMax(f32);
+    const data = [_]f32{ big, -big, -big, big };
+    const ix = try build(gpa, &data, 2, 0, null);
+    defer ix.deinit(gpa);
+    for (ix.norms) |v| try std.testing.expect(std.math.isFinite(v) and v > 0);
+    const q = try prepare(gpa, ix, data[0..2], 0, 0);
+    defer q.deinit(gpa);
+    try std.testing.expect(std.math.isFinite(q.norm));
+    try std.testing.expectApproxEqAbs(@as(f64, 1), (try estimate(ix, q, 0, default_eps0)).ip, 1e-12);
+}
+
+test "one-bit exact-query estimate is bit-identical to a per-coordinate scan" {
+    const gpa = std.testing.allocator;
+    for ([_]usize{ 1, 3, 64, 65, 200 }) |d| {
+        const data = try randomData(gpa, 20, d, d);
+        defer gpa.free(data);
+        const ix = try build(gpa, data, d, 9, null);
+        defer ix.deinit(gpa);
+        const q = try prepare(gpa, ix, data[d..][0..d], 0, 0);
+        defer q.deinit(gpa);
+        const pd: f64 = @floatFromInt(ix.padded);
+        for (0..ix.n) |i| {
+            if (ix.norms[i] == 0) continue;
+            const cw = ix.code(i);
+            var on_sum: f64 = 0;
+            var all_sum: f64 = 0;
+            for (q.y, 0..) |v, j| {
+                if ((cw[j / 64] >> @intCast(j % 64)) & 1 == 1) on_sum += v;
+                all_sum += v;
+            }
+            const ip = (2 * on_sum - all_sum) / @sqrt(pd) / ix.dots[i];
+            try std.testing.expectEqual(ip, (try estimate(ix, q, i, default_eps0)).ip);
+        }
+    }
+}
+
+fn buildAlloc(gpa: std.mem.Allocator, data: []const f32, bits: u8) !void {
+    const ix = try buildBits(gpa, data, 5, 3, null, bits);
+    defer ix.deinit(gpa);
+    const q = try prepare(gpa, ix, data[0..5], 4, 1);
+    defer q.deinit(gpa);
+    var out: [3]u32 = undefined;
+    _ = try search(gpa, ix, q, &out);
+}
+
+test "buildBits, prepare and search free everything on allocation failure" {
+    var data: [8 * 5]f32 = undefined;
+    for (&data, 0..) |*x, i| x.* = @floatFromInt((i * 5) % 9);
+    for ([_]u8{ 1, 2, 8 }) |bits| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, buildAlloc, .{ @as([]const f32, &data), bits });
+    }
 }

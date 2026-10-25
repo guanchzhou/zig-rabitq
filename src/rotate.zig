@@ -14,8 +14,11 @@ pub fn splitmix64(seed: u64, i: u64) u64 {
 
 pub const rounds = 3;
 
-pub fn paddedLen(dims: usize) usize {
-    return std.math.ceilPowerOfTwo(usize, @max(dims, 2)) catch unreachable;
+pub const Error = error{ DimensionMismatch, DimensionTooLarge };
+
+/// The next power of two `>= dims`, at least 2; `error.DimensionTooLarge` if it does not fit in a `usize`.
+pub fn paddedLen(dims: usize) Error!usize {
+    return std.math.ceilPowerOfTwo(usize, @max(dims, 2)) catch error.DimensionTooLarge;
 }
 
 /// In-place unnormalised fast Walsh-Hadamard transform; `x.len` must be a power of two.
@@ -47,15 +50,25 @@ fn fwht(x: []f64) void {
     }
 }
 
-/// y = R x for `x` of any length up to `y.len`, which must be `paddedLen(x.len)`.
-pub fn apply(seed: u64, x: []const f32, y: []f64) void {
-    const n = y.len;
-    std.debug.assert(std.math.isPowerOfTwo(n) and x.len <= n);
+/// y = R x for `x` of any length up to `y.len`, which must be a power of two such as `paddedLen(x.len)`.
+pub fn apply(seed: u64, x: []const f32, y: []f64) Error!void {
+    if (y.len == 0 or !std.math.isPowerOfTwo(y.len) or x.len > y.len) return error.DimensionMismatch;
     for (y, 0..) |*v, i| v.* = if (i < x.len) x[i] else 0;
+    transform(seed, y);
+}
+
+/// y = R y in place; `y.len` must be a power of two.
+pub fn applyInPlace(seed: u64, y: []f64) Error!void {
+    if (y.len == 0 or !std.math.isPowerOfTwo(y.len)) return error.DimensionMismatch;
+    transform(seed, y);
+}
+
+fn transform(seed: u64, y: []f64) void {
+    const n = y.len;
     const scale = 1.0 / @sqrt(@as(f64, @floatFromInt(n)));
     for (0..rounds) |r| {
         for (y, 0..) |*v, i| {
-            if (splitmix64(seed, r * n + i) & 1 == 1) v.* = -v.*;
+            if (splitmix64(seed, r *% n +% i) & 1 == 1) v.* = -v.*;
         }
         fwht(y);
         for (y) |*v| v.* *= scale;
@@ -71,15 +84,36 @@ test "orthogonal: preserves norms and inner products" {
         x.* = r.floatNorm(f32);
         y.* = r.floatNorm(f32);
     }
-    const n = paddedLen(37);
+    const n = try paddedLen(37);
     try std.testing.expectEqual(@as(usize, 64), n);
     var ya: [64]f64 = undefined;
     var yb: [64]f64 = undefined;
-    apply(7, &a, &ya);
-    apply(7, &b, &yb);
+    try apply(7, &a, &ya);
+    try apply(7, &b, &yb);
     var dx: f64 = 0;
     var dy: f64 = 0;
     for (a, b) |x, y| dx += @as(f64, x) * y;
     for (ya, yb) |x, y| dy += x * y;
     try std.testing.expectApproxEqAbs(dx, dy, 1e-9);
+}
+
+test "paddedLen and apply reject sizes they cannot handle" {
+    try std.testing.expectEqual(@as(usize, 2), try paddedLen(0));
+    try std.testing.expectEqual(@as(usize, 1) << 63, try paddedLen((@as(usize, 1) << 63) - 1));
+    try std.testing.expectError(error.DimensionTooLarge, paddedLen((@as(usize, 1) << 63) + 1));
+    try std.testing.expectError(error.DimensionTooLarge, paddedLen(std.math.maxInt(usize)));
+    var y: [4]f64 = undefined;
+    try std.testing.expectError(error.DimensionMismatch, apply(1, &.{ 1, 2, 3 }, y[0..3]));
+    try std.testing.expectError(error.DimensionMismatch, apply(1, &.{ 1, 2, 3, 4, 5 }, &y));
+    try std.testing.expectError(error.DimensionMismatch, apply(1, &.{}, y[0..0]));
+    try std.testing.expectError(error.DimensionMismatch, applyInPlace(1, y[0..3]));
+}
+
+test "applyInPlace matches apply" {
+    const x = [_]f32{ 1, -2, 3.5, 0.25, 7 };
+    var a: [8]f64 = undefined;
+    try apply(3, &x, &a);
+    var b: [8]f64 = .{ 1, -2, 3.5, 0.25, 7, 0, 0, 0 };
+    try applyInPlace(3, &b);
+    try std.testing.expectEqualSlices(f64, &a, &b);
 }

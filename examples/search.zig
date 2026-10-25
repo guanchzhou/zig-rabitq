@@ -26,6 +26,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.assert(top[0] == 123);
 
     // The error bound brackets the true inner product for the found vector.
-    const e = index.estimate(ix, q, 123, 3);
+    const e = try index.estimate(ix, q, 123, 3);
     std.debug.assert(e.ip - e.bound < 1 and e.bound > 0);
 }
